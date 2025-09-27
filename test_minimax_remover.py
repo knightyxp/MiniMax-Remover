@@ -98,8 +98,8 @@ def save_processed_mask_video(masks, output_path):
     print(f"视频形状: {masks_np.shape}")
     print(f"数据范围: {masks_np.min()} - {masks_np.max()}")
 
-video_path = "/projects/D2DCRC/xiangpeng/Filter_Video_In_context_data/sample_videos/multi_instance_grounding_aligned/0011_src_e93f38782e58df3ef5adfae8ef6a8adb_org.mp4"
-mask_path = "/projects/D2DCRC/xiangpeng/Filter_Video_In_context_data/sample_videos/multi_instance_grounding_aligned/0011_tgt_e93f38782e58df3ef5adfae8ef6a8adb.mp4"
+video_path = "test_video/0011_src_e93f38782e58df3ef5adfae8ef6a8adb_org.mp4"
+mask_path = "test_video/0011_tgt_e93f38782e58df3ef5adfae8ef6a8adb.mp4"
 
 images = load_video(video_path)
 masks = load_mask(mask_path)
