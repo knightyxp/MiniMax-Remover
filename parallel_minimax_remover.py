@@ -127,9 +127,8 @@ def main():
             mask_dir = os.path.dirname(item_data["edited_video"])
             mask_filename = os.path.basename(item_data["edited_video"])
             
-            # Replace _gray_ with _rem_ for output filename
-            if "_gray_" in mask_filename:
-                output_filename = mask_filename.replace("_gray_", "_rem_")
+            if "_mask_" in mask_filename:
+                output_filename = mask_filename.replace("_mask_", "_rem_")
             else:
                 # Fallback: add _rem before extension
                 name, ext = os.path.splitext(mask_filename)
