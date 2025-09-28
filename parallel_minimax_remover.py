@@ -105,7 +105,7 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    print(f"[Rank {global_rank} Local {local_rank}] start. world_size={world_size}, device={device}")
+    print(f"[Rank {global_rank}] world_size={world_size} device={device}")
 
     # load test json
     with open(args.test_json, 'r', encoding='utf-8') as f:
@@ -114,10 +114,12 @@ def main():
 
     # 更稳健的分配：按 idx % world_size 分配
     subset = [items[i] for i in range(len(items)) if (i % world_size) == global_rank]
-    print(f"[Rank {global_rank}] assigned {len(subset)} items")
+    total_items = len(subset)
+    print(f"[Rank {global_rank}] assigned {total_items} items")
 
     # load models -> 强制移动到当前 GPU
-    print(f"[Rank {global_rank}] Loading models to {device} ...")
+    # concise log: loading models once per rank
+    print(f"[Rank {global_rank}] Loading models ...")
     try:
         vae = AutoencoderKLWan.from_pretrained(os.path.join(args.model_path, "vae"),
                                               torch_dtype=torch.float16)
@@ -137,16 +139,13 @@ def main():
     pipe.to(device)
 
     # diagnostic: print param device
-    try:
-        print(f"[diag Rank {global_rank}] vae param device: {next(vae.parameters()).device}")
-        print(f"[diag Rank {global_rank}] transformer param device: {next(transformer.parameters()).device}")
-    except StopIteration:
-        pass
+    # no per-rank detailed device spam; keep logs minimal
 
     # iterate items
     for idx, (key, item_data) in enumerate(subset):
         try:
-            print(f"[Rank {global_rank}] [{idx+1}/{len(subset)}] Processing {key} ...")
+            if (idx + 1) % 10 == 1 or (idx + 1) == total_items:
+                print(f"[Rank {global_rank}] progress {idx+1}/{total_items}")
             original_video_path = os.path.join(args.base_path, item_data["original_video"])
             mask_video_path = os.path.join(args.base_path, item_data["edited_video"])
 
@@ -173,13 +172,12 @@ def main():
                 continue
 
             # load
-            print(f"[Rank {global_rank}] Loading video: {original_video_path}")
+            # minimal per-item logs
             images = load_video(original_video_path, args.video_length)
             if images is None:
                 print(f"[Rank {global_rank}] Skip {key}: video too short")
                 continue
 
-            print(f"[Rank {global_rank}] Loading mask: {mask_video_path}")
             masks = load_mask(mask_video_path, args.video_length)
             if masks is None:
                 print(f"[Rank {global_rank}] Skip {key}: mask too short")
@@ -189,53 +187,23 @@ def main():
             images = images.to(device=device, dtype=torch.float32)  # shape (1,C,T,H,W)
             masks = masks.to(device=device, dtype=torch.float32)    # shape (1,1,T,H,W)
 
-            # diag
-            print(f"[diag {global_rank}] images device: {images.device}, masks device: {masks.device}")
             # run inference
-            print(f"[Rank {global_rank}] Running inference ...")
             video_out = inference(pipe, images, masks, device,
                                   video_length=args.video_length,
                                   random_seed=args.seed,
                                   num_inference_steps=args.num_inference_steps,
                                   iterations=args.iterations)
 
-            # save result - export_to_video 需要 numpy 或 list of frames
-            print(f"[Rank {global_rank}] Saving result to: {output_video_path}")
-            # 如果 video_out 是 torch.Tensor，转为 numpy；假设 shape (T, H, W, C) 或 (B?, T, H, W, C)
-            if isinstance(video_out, torch.Tensor):
-                v = video_out.detach().cpu().numpy()
-            else:
-                v = np.array(video_out)
-
-            # 若 v 维度是 (B, T, H, W, C) 取第0个
-            if v.ndim == 5 and v.shape[0] == 1:
-                v = v[0]
-            # export_to_video 希望 uint8 或 float in [-1,1]? diffusers.utils 会处理，但我们转换到 uint8
-            # v assumed in [-1,1], convert back to [0,255]
-            if v.dtype == np.float32 or v.dtype == np.float64:
-                v = ((v + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-
-            # ensure (T,H,W,C)
-            export_to_video(v, output_video_path)
-
-            # write info file
-            info_path = os.path.splitext(output_video_path)[0] + "_info.txt"
-            with open(info_path, "w", encoding="utf-8") as f:
-                f.write(f"Key: {key}\n")
-                f.write(f"Original video: {original_video_path}\n")
-                f.write(f"Mask video: {mask_video_path}\n")
-                f.write(f"Edit instruction: {item_data.get('edit_instruction','')}\n")
-                f.write(f"Video length: {args.video_length}\n")
-                f.write(f"Iterations: {args.iterations}\n")
-            print(f"[Rank {global_rank}] Successfully processed {key}")
+            export_to_video(video_out, output_video_path)
+            # optional: per-item success omitted to reduce noise
 
         except Exception as e:
-            print(f"[Rank {global_rank}] Error processing {key}: {e}")
+            print(f"[Rank {global_rank}] error {idx+1}/{total_items} key={key}: {e}")
             traceback.print_exc()
             # 继续下一个 item
             continue
 
-    print(f"[Rank {global_rank}] All done.")
+    print(f"[Rank {global_rank}] done {total_items} items")
     dist.destroy_process_group()
 
 
