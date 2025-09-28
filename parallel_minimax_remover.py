@@ -82,14 +82,41 @@ def main():
     with open(args.test_json, 'r') as f:
         test_data = json.load(f)
     
-    # Convert to list of items for distribution
+    # Convert to list of items
     items = list(test_data.items())
+
+    # Pre-filter: skip items whose output has already been generated
+    def _compute_output_path(item_data):
+        mask_rel = item_data["edited_video"]
+        mask_dir = os.path.dirname(mask_rel)
+        mask_filename = os.path.basename(mask_rel)
+        if "_mask_" in mask_filename:
+            output_filename = mask_filename.replace("_mask_", "_rem_")
+        else:
+            name, ext = os.path.splitext(mask_filename)
+            output_filename = f"{name}_rem{ext}"
+        return os.path.join(args.base_path, mask_dir, output_filename)
+
+    pending_items = []
+    done_items = []
+    for key, item_data in items:
+        out_path = _compute_output_path(item_data)
+        if os.path.exists(out_path):
+            done_items.append((key, item_data))
+        else:
+            pending_items.append((key, item_data))
+
+    if rank == 0:
+        print(f"[Filter] Total: {len(items)}, Done: {len(done_items)}, Pending: {len(pending_items)}")
+
+    # Distribute only pending items across ranks
+    items = pending_items
     per_rank = len(items) // world_size
     start_idx = rank * per_rank
     end_idx = (rank + 1) * per_rank if rank != world_size - 1 else len(items)
     subset = items[start_idx:end_idx]
-    
-    print(f"[Rank {rank}] Processing {len(subset)} items ({start_idx} to {end_idx-1})")
+
+    print(f"[Rank {rank}] Processing {len(subset)} pending items ({start_idx} to {max(end_idx-1, start_idx-1)})")
     
     # Load MiniMax Remover models
     print(f"[Rank {rank}] Loading MiniMax Remover models...")
