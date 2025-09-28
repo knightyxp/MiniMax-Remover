@@ -44,48 +44,28 @@ def parse_args():
     return parser.parse_args()
 
 def load_video(video_path, video_length=81):
-    """
-    使用 decord 读取视频，返回 shape (1, C, T, H, W), dtype float32, 值范围大致 [-1,1]
-    如果视频帧少于 video_length，则返回 None（调用处跳过）
-    """
-    vr = VideoReader(video_path, ctx=cpu(0))
-    nframes = len(vr)
-    if nframes < video_length:
-        # 可选：你也可以 pad 到目标长度，但这里直接跳过并返回 None
-        print(f"[load_video] video too short: {video_path} has {nframes} frames, need {video_length}")
-        return None
-
-    # decord 返回 numpy uint8 的 (T, H, W, C)
-    frames = vr.get_batch(list(range(video_length))).asnumpy()  # shape (T, H, W, C)
-    frames = frames.astype(np.float32)
-    # normalize to [-1, 1]
-    frames = frames / 127.5 - 1.0
-    # from (T, H, W, C) -> (C, T, H, W)
-    frames = np.transpose(frames, (3, 0, 1, 2))
-    # add batch dim -> (1, C, T, H, W)
-    frames = np.expand_dims(frames, axis=0)
-    return torch.from_numpy(frames)
+    """Load video frames"""
+    vr = VideoReader(video_path)
+    images = vr.get_batch(list(range(video_length))).asnumpy()
+    images = torch.from_numpy(images)/127.5 - 1.0
+    return images
 
 def load_mask(mask_path, video_length=81):
-    """
-    读取 mask 视频并二值化，输出形状 (1, 1, T, H, W), dtype float32，值为 0或1。
-    """
-    vr = VideoReader(mask_path, ctx=cpu(0))
-    nframes = len(vr)
-    if nframes < video_length:
-        print(f"[load_mask] mask too short: {mask_path} has {nframes} frames, need {video_length}")
-        return None
-
-    masks = vr.get_batch(list(range(video_length))).asnumpy()  # (T, H, W, C)
-    masks = masks.astype(np.float32)
-    # convert to single-channel by taking max over RGB
-    masks_gray = np.max(masks, axis=-1, keepdims=True)  # (T, H, W, 1)
-    # threshold (跟你原逻辑一致)
-    masks_binary = np.where(masks_gray > 10.0, 1.0, 0.0).astype(np.float32)
-    # (T, H, W, 1) -> (1, 1, T, H, W)
-    masks_binary = np.transpose(masks_binary, (3, 0, 1, 2))  # (1, T, H, W) because C first
-    masks_binary = np.expand_dims(masks_binary, axis=0)  # (1,1,T,H,W)
-    return torch.from_numpy(masks_binary)
+    """Load and process mask video"""
+    vr = VideoReader(mask_path)
+    masks = vr.get_batch(list(range(video_length))).asnumpy()
+    masks = torch.from_numpy(masks)
+    
+    # 对于彩色mask，使用RGB通道的最大值
+    masks_gray = torch.max(masks, dim=-1, keepdim=True)[0]
+    
+    # 二值化处理
+    masks_binary = masks_gray.clone()
+    masks_binary[masks_binary > 10] = 255  # 非黑色区域设为白色
+    masks_binary[masks_binary <= 10] = 0   # 黑色区域保持黑色
+    
+    masks_binary = masks_binary / 255.0
+    return masks_binary
 
 def inference(pipe, pixel_values, masks, device, video_length=81, random_seed=42,
               num_inference_steps=12, iterations=6):
