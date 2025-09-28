@@ -78,8 +78,8 @@ def inference(pipe, pixel_values, masks, device, video_length=81, random_seed=42
         images=pixel_values,
         masks=masks,
         num_frames=video_length,
-        height=pixel_values.shape[-2],
-        width=pixel_values.shape[-1],
+        height=pixel_values.shape[1],
+        width=pixel_values.shape[2],
         num_inference_steps=num_inference_steps,
         generator=gen,
         iterations=iterations
@@ -159,9 +159,9 @@ def main():
                 output_filename = f"{name}_rem{ext}"
             output_video_path = os.path.join(args.base_path, mask_dir, output_filename)
             os.makedirs(os.path.dirname(output_video_path), exist_ok=True)
-            if os.path.exists(output_video_path):
-                print(f"[Rank {global_rank}] Output exists, skip: {output_video_path}")
-                continue
+            # if os.path.exists(output_video_path):
+            #     print(f"[Rank {global_rank}] Output exists, skip: {output_video_path}")
+            #     continue
 
             # check inputs
             if not os.path.exists(original_video_path):
