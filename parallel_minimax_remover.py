@@ -41,6 +41,10 @@ def load_mask(mask_path, video_length=81):
 
 def inference(pipe, pixel_values, masks, device, video_length=81, random_seed=42, iterations=6):
     """Run MiniMax Remover inference"""
+    # 确保输入数据在正确的设备上
+    pixel_values = pixel_values.to(device)
+    masks = masks.to(device)
+    
     video = pipe(
         images=pixel_values,
         masks=masks,
@@ -52,6 +56,20 @@ def inference(pipe, pixel_values, masks, device, video_length=81, random_seed=42
         iterations=iterations
     ).frames[0]
     return video
+
+def compute_output_path(item_data, base_path):
+    """统一的输出路径计算函数 - 保持原有逻辑"""
+    mask_dir = os.path.dirname(item_data["edited_video"])
+    mask_filename = os.path.basename(item_data["edited_video"])
+    
+    if "_mask_" in mask_filename:
+        output_filename = mask_filename.replace("_mask_", "_rem_")
+    else:
+        # Fallback: add _rem before extension
+        name, ext = os.path.splitext(mask_filename)
+        output_filename = f"{name}_rem{ext}"
+    
+    return os.path.join(base_path, mask_dir, output_filename)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Parallel MiniMax Remover inference")
@@ -65,6 +83,8 @@ def parse_args():
                         help="Video length in frames")
     parser.add_argument("--iterations", type=int, default=6,
                         help="Iterations for mask dilation")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for generation")
     return parser.parse_args()
 
 def main():
@@ -74,6 +94,7 @@ def main():
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     
     print(f"[Rank {rank}] Initialized on device {device}")
@@ -86,28 +107,37 @@ def main():
     items = list(test_data.items())
 
     # Pre-filter: skip items whose output has already been generated
-    def _compute_output_path(item_data):
-        mask_rel = item_data["edited_video"]
-        mask_dir = os.path.dirname(mask_rel)
-        mask_filename = os.path.basename(mask_rel)
-        if "_mask_" in mask_filename:
-            output_filename = mask_filename.replace("_mask_", "_rem_")
-        else:
-            name, ext = os.path.splitext(mask_filename)
-            output_filename = f"{name}_rem{ext}"
-        return os.path.join(args.base_path, mask_dir, output_filename)
-
     pending_items = []
     done_items = []
     for key, item_data in items:
-        out_path = _compute_output_path(item_data)
+        out_path = compute_output_path(item_data, args.base_path)
         if os.path.exists(out_path):
             done_items.append((key, item_data))
         else:
+            # 检查输入文件是否存在
+            original_video_path = os.path.join(args.base_path, item_data["original_video"])
+            mask_video_path = os.path.join(args.base_path, item_data["edited_video"])
+            
+            if not os.path.exists(original_video_path):
+                if rank == 0:
+                    print(f"[Filter] Original video not found for {key}: {original_video_path}")
+                continue
+            
+            if not os.path.exists(mask_video_path):
+                if rank == 0:
+                    print(f"[Filter] Mask video not found for {key}: {mask_video_path}")
+                continue
+                
             pending_items.append((key, item_data))
 
     if rank == 0:
         print(f"[Filter] Total: {len(items)}, Done: {len(done_items)}, Pending: {len(pending_items)}")
+
+    # 如果没有待处理任务，退出
+    if len(pending_items) == 0:
+        print(f"[Rank {rank}] No pending items to process, exiting...")
+        dist.destroy_process_group()
+        return
 
     # Distribute only pending items across ranks
     items = pending_items
@@ -116,87 +146,92 @@ def main():
     end_idx = (rank + 1) * per_rank if rank != world_size - 1 else len(items)
     subset = items[start_idx:end_idx]
 
-    print(f"[Rank {rank}] Processing {len(subset)} pending items ({start_idx} to {max(end_idx-1, start_idx-1)})")
+    print(f"[Rank {rank}] Processing {len(subset)} pending items ({start_idx} to {max(end_idx-1, start_idx)})")
     
-    # Load MiniMax Remover models
-    print(f"[Rank {rank}] Loading MiniMax Remover models...")
+    # Load MiniMax Remover models on CPU first (following pattern from doc 4)
+    print(f"[Rank {rank}] Loading MiniMax Remover models on CPU...")
+    
+    # Load models to CPU with explicit device mapping
     vae = AutoencoderKLWan.from_pretrained(
         os.path.join(args.model_path, "vae"), 
-        torch_dtype=torch.float16
+        torch_dtype=torch.float16,
+        device_map={"": "cpu"}  # 明确指定加载到CPU
     )
+    
     transformer = Transformer3DModel.from_pretrained(
         os.path.join(args.model_path, "transformer"), 
-        torch_dtype=torch.float16
+        torch_dtype=torch.float16,
+        device_map={"": "cpu"}  # 明确指定加载到CPU
     )
+    
     scheduler = UniPCMultistepScheduler.from_pretrained(
         os.path.join(args.model_path, "scheduler")
     )
     
+    # Create pipeline on CPU
     pipe = Minimax_Remover_Pipeline(
         transformer=transformer, 
         vae=vae, 
         scheduler=scheduler
     )
-    pipe.to(device)
-    print(f"[Rank {rank}] Models loaded successfully")
+    
+    # Now move the entire pipeline to the target GPU
+    print(f"[Rank {rank}] Moving models to {device}...")
+    pipe = pipe.to(device)
+    
+    # Set evaluation mode
+    pipe.vae.eval()
+    pipe.transformer.eval()
+    
+    print(f"[Rank {rank}] Models loaded successfully on {device}")
     
     # Process each item
+    successful = 0
+    failed = 0
+    
     for key, item_data in subset:
         try:
-            print(f"[Rank {rank}] Processing {key}...")
-            
             # Construct file paths
             original_video_path = os.path.join(args.base_path, item_data["original_video"])
             mask_video_path = os.path.join(args.base_path, item_data["edited_video"])
-            
-            # Generate output path
-            # Extract directory and filename from mask path
-            mask_dir = os.path.dirname(item_data["edited_video"])
-            mask_filename = os.path.basename(item_data["edited_video"])
-            
-            if "_mask_" in mask_filename:
-                output_filename = mask_filename.replace("_mask_", "_rem_")
-            else:
-                # Fallback: add _rem before extension
-                name, ext = os.path.splitext(mask_filename)
-                output_filename = f"{name}_rem{ext}"
-            
-            output_video_path = os.path.join(args.base_path, mask_dir, output_filename)
+            output_video_path = compute_output_path(item_data, args.base_path)
             
             # Create output directory if it doesn't exist
             os.makedirs(os.path.dirname(output_video_path), exist_ok=True)
             
-            # Check if output already exists
+            # Double-check if output already exists
             if os.path.exists(output_video_path):
                 print(f"[Rank {rank}] Output already exists for {key}, skipping...")
                 continue
             
-            # Check if input files exist
-            if not os.path.exists(original_video_path):
-                print(f"[Rank {rank}] Original video not found: {original_video_path}")
-                continue
+            print(f"[Rank {rank}] Processing {key}...")
             
-            if not os.path.exists(mask_video_path):
-                print(f"[Rank {rank}] Mask video not found: {mask_video_path}")
-                continue
-            
-            # Load video and mask
+            # Load video and mask - load to CPU first, then move to device
             print(f"[Rank {rank}] Loading video: {original_video_path}")
             images = load_video(original_video_path, args.video_length)
+            images = images.to(device)
             
             print(f"[Rank {rank}] Loading mask: {mask_video_path}")
             masks = load_mask(mask_video_path, args.video_length)
+            masks = masks.to(device)
             
             # Run inference
             print(f"[Rank {rank}] Running inference...")
-            video = inference(
-                pipe, images, masks, device, 
-                args.video_length, iterations=args.iterations
-            )
+            with torch.no_grad():
+                video = inference(
+                    pipe, images, masks, device, 
+                    args.video_length, 
+                    random_seed=args.seed,
+                    iterations=args.iterations
+                )
             
-            # Save result
+            # Save result with atomic write
+            temp_output_path = output_video_path.replace(".mp4", "_temp.mp4")
             print(f"[Rank {rank}] Saving result to: {output_video_path}")
-            export_to_video(video, output_video_path)
+            export_to_video(video, temp_output_path)
+            
+            # Atomic rename
+            os.rename(temp_output_path, output_video_path)
             
             # Save info file
             info_path = output_video_path.replace(".mp4", "_info.txt")
@@ -207,16 +242,50 @@ def main():
                 f.write(f"Edit instruction: {item_data['edit_instruction']}\n")
                 f.write(f"Video length: {args.video_length}\n")
                 f.write(f"Iterations: {args.iterations}\n")
+                f.write(f"Seed: {args.seed}\n")
+                f.write(f"Processed by rank: {rank}\n")
             
             print(f"[Rank {rank}] Successfully processed {key}")
+            successful += 1
+            
+            # 清理GPU缓存
+            if successful % 5 == 0:  # 每5个视频清理一次
+                torch.cuda.empty_cache()
             
         except Exception as e:
             print(f"[Rank {rank}] Error processing {key}: {str(e)}")
             import traceback
             traceback.print_exc()
+            failed += 1
+            
+            # 错误时也清理缓存
+            torch.cuda.empty_cache()
             continue
     
-    print(f"[Rank {rank}] Finished processing all items")
+    print(f"[Rank {rank}] Finished processing: {successful} successful, {failed} failed")
+    
+    # 同步所有rank
+    dist.barrier()
+    
+    # 收集统计信息
+    if rank == 0:
+        all_successful = successful
+        all_failed = failed
+        for r in range(1, world_size):
+            recv_success = torch.tensor([0], dtype=torch.int32, device=device)
+            recv_fail = torch.tensor([0], dtype=torch.int32, device=device)
+            dist.recv(recv_success, src=r)
+            dist.recv(recv_fail, src=r)
+            all_successful += recv_success.item()
+            all_failed += recv_fail.item()
+        
+        print(f"\n[Summary] Total processed: {all_successful} successful, {all_failed} failed")
+    else:
+        dist.send(torch.tensor([successful], dtype=torch.int32, device=device), dst=0)
+        dist.send(torch.tensor([failed], dtype=torch.int32, device=device), dst=0)
+    
+    # Cleanup
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
