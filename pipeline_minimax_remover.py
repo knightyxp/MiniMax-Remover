@@ -88,11 +88,11 @@ class Minimax_Remover_Pipeline(DiffusionPipeline):
         masks = masks[None,...]
         return masks
 
-    def resize(self, images, w, h):
+    def resize(self, images, height, width):
         bsz,_,_,_,_ = images.shape
-        images = rearrange(images, "b c f w h -> (b f) c w h")
-        images = F.interpolate(images, (w,h), mode='bilinear')
-        images = rearrange(images, "(b f) c w h -> b c f w h", b=bsz)
+        images = rearrange(images, "b c f h w -> (b f) c h w")
+        images = F.interpolate(images, (height, width), mode='bilinear')
+        images = rearrange(images, "(b f) c h w -> b c f h w", b=bsz)
         return images
 
     @property
@@ -147,10 +147,10 @@ class Minimax_Remover_Pipeline(DiffusionPipeline):
         )
 
         masks = self.expand_masks(masks, iterations)
-        masks = self.resize(masks, height, width).to("cuda:0").half()
+        masks = self.resize(masks, height, width).to(device).half()
         masks[masks>0] = 1
         images = rearrange(images, "f h w c -> c f h w")
-        images = self.resize(images[None,...], height, width).to("cuda:0").half()
+        images = self.resize(images[None,...], height, width).to(device).half()
 
         masked_images = images * (1-masks)
 
