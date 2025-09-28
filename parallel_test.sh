@@ -1,4 +1,3 @@
-sleep 2h
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 torchrun --standalone --nproc_per_node=4 parallel_minimax_remover.py \
     --test_json grounding_multi_instance_gray.json \
