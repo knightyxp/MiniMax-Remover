@@ -41,10 +41,6 @@ def load_mask(mask_path, video_length=81):
 
 def inference(pipe, pixel_values, masks, device, video_length=81, random_seed=42, iterations=6):
     """Run MiniMax Remover inference"""
-    # 确保输入数据在正确的设备上
-    pixel_values = pixel_values.to(device)
-    masks = masks.to(device)
-    
     video = pipe(
         images=pixel_values,
         masks=masks,
@@ -94,6 +90,8 @@ def main():
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    
+    # 关键修改：设置当前进程的默认设备
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     
@@ -148,42 +146,55 @@ def main():
 
     print(f"[Rank {rank}] Processing {len(subset)} pending items ({start_idx} to {max(end_idx-1, start_idx)})")
     
-    # Load MiniMax Remover models on CPU first (following pattern from doc 4)
-    print(f"[Rank {rank}] Loading MiniMax Remover models on CPU...")
+    # 关键修改：使用环境变量设置当前GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
     
-    # Load models to CPU with explicit device mapping
+    # Load MiniMax Remover models - 重要：不使用device_map
+    print(f"[Rank {rank}] Loading MiniMax Remover models...")
+    
+    # 方法1：直接加载到指定设备（使用map_location）
     vae = AutoencoderKLWan.from_pretrained(
         os.path.join(args.model_path, "vae"), 
-        torch_dtype=torch.float16,
-        device_map={"": "cpu"}  # 明确指定加载到CPU
+        torch_dtype=torch.float16
     )
     
     transformer = Transformer3DModel.from_pretrained(
         os.path.join(args.model_path, "transformer"), 
-        torch_dtype=torch.float16,
-        device_map={"": "cpu"}  # 明确指定加载到CPU
+        torch_dtype=torch.float16
     )
     
     scheduler = UniPCMultistepScheduler.from_pretrained(
         os.path.join(args.model_path, "scheduler")
     )
     
-    # Create pipeline on CPU
+    # 创建pipeline
     pipe = Minimax_Remover_Pipeline(
         transformer=transformer, 
         vae=vae, 
         scheduler=scheduler
     )
     
-    # Now move the entire pipeline to the target GPU
-    print(f"[Rank {rank}] Moving models to {device}...")
-    pipe = pipe.to(device)
+    # 关键修改：确保所有模型组件都移动到正确的设备
+    # 手动移动所有模型到指定设备
+    pipe.vae = pipe.vae.to(device)
+    pipe.transformer = pipe.transformer.to(device)
     
-    # Set evaluation mode
+    # 重要：确保VAE的内部缓存也在正确的设备上
+    if hasattr(pipe.vae, '_enc_feat_map'):
+        if pipe.vae._enc_feat_map is not None:
+            pipe.vae._enc_feat_map = [f.to(device) if f is not None else None for f in pipe.vae._enc_feat_map]
+    if hasattr(pipe.vae, '_dec_feat_map'):
+        if pipe.vae._dec_feat_map is not None:
+            pipe.vae._dec_feat_map = [f.to(device) if f is not None else None for f in pipe.vae._dec_feat_map]
+    
+    # 设置评估模式
     pipe.vae.eval()
     pipe.transformer.eval()
     
     print(f"[Rank {rank}] Models loaded successfully on {device}")
+    
+    # 同步所有rank
+    dist.barrier()
     
     # Process each item
     successful = 0
@@ -206,7 +217,7 @@ def main():
             
             print(f"[Rank {rank}] Processing {key}...")
             
-            # Load video and mask - load to CPU first, then move to device
+            # Load video and mask - 加载后立即移动到设备
             print(f"[Rank {rank}] Loading video: {original_video_path}")
             images = load_video(original_video_path, args.video_length)
             images = images.to(device)
@@ -218,12 +229,13 @@ def main():
             # Run inference
             print(f"[Rank {rank}] Running inference...")
             with torch.no_grad():
-                video = inference(
-                    pipe, images, masks, device, 
-                    args.video_length, 
-                    random_seed=args.seed,
-                    iterations=args.iterations
-                )
+                with torch.cuda.amp.autocast(dtype=torch.float16):  # 使用自动混合精度
+                    video = inference(
+                        pipe, images, masks, device, 
+                        args.video_length, 
+                        random_seed=args.seed,
+                        iterations=args.iterations
+                    )
             
             # Save result with atomic write
             temp_output_path = output_video_path.replace(".mp4", "_temp.mp4")
@@ -249,7 +261,7 @@ def main():
             successful += 1
             
             # 清理GPU缓存
-            if successful % 5 == 0:  # 每5个视频清理一次
+            if successful % 5 == 0:
                 torch.cuda.empty_cache()
             
         except Exception as e:
@@ -258,7 +270,7 @@ def main():
             traceback.print_exc()
             failed += 1
             
-            # 错误时也清理缓存
+            # 错误时清理缓存
             torch.cuda.empty_cache()
             continue
     
@@ -268,21 +280,14 @@ def main():
     dist.barrier()
     
     # 收集统计信息
+    successful_tensor = torch.tensor([successful], dtype=torch.int32, device=device)
+    failed_tensor = torch.tensor([failed], dtype=torch.int32, device=device)
+    
+    dist.all_reduce(successful_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(failed_tensor, op=dist.ReduceOp.SUM)
+    
     if rank == 0:
-        all_successful = successful
-        all_failed = failed
-        for r in range(1, world_size):
-            recv_success = torch.tensor([0], dtype=torch.int32, device=device)
-            recv_fail = torch.tensor([0], dtype=torch.int32, device=device)
-            dist.recv(recv_success, src=r)
-            dist.recv(recv_fail, src=r)
-            all_successful += recv_success.item()
-            all_failed += recv_fail.item()
-        
-        print(f"\n[Summary] Total processed: {all_successful} successful, {all_failed} failed")
-    else:
-        dist.send(torch.tensor([successful], dtype=torch.int32, device=device), dst=0)
-        dist.send(torch.tensor([failed], dtype=torch.int32, device=device), dst=0)
+        print(f"\n[Summary] Total processed: {successful_tensor.item()} successful, {failed_tensor.item()} failed")
     
     # Cleanup
     dist.destroy_process_group()
