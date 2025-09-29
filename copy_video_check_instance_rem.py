@@ -11,7 +11,7 @@ from pathlib import Path
 
 # -------- 配置区域 --------
 BASE_DATASET_DIR = "/scratch3/yan204/yxp/Senorita"
-JSON_PATH = "gen_instruction/grounding_multi_instance_rem.json"
+JSON_PATH = "grounding_multi_instance_rem.json"
 OUTPUT_DIR = "sample_videos/grounding_multi_instance_rem_check"
 TOP_K = 4000        # 取 VIE score top K
 LAYER_SIZE = 1000      # 每层数据大小
