@@ -24,20 +24,28 @@ def main():
     # 确保输出目录存在
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # 加载 JSON
+    # 加载 JSON（兼容字典结构：key -> {original_video, edited_video, edit_instruction}）
     with open(JSON_PATH, 'r', encoding='utf-8') as f:
         raw = json.load(f)
     
     # 提取结果列表
     if isinstance(raw, list):
         results = raw
-    elif isinstance(raw, dict) and 'results' in raw:
-        results = raw['results']
+    elif isinstance(raw, dict):
+        # 将字典展开为列表，保留原始键，便于后续 info 标注
+        results = []
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                item = dict(v)
+                item.setdefault('_id', k)
+                results.append(item)
+            else:
+                results.append({'_id': k, 'value': v})
     else:
         raise RuntimeError("JSON 文件格式不符合预期，请检查数据格式")
     
-    # 筛选并排序（假设已经按dover_score排序）
-    valid = [itm for itm in results if itm.get('vie_overall_score') is not None]
+    # 不再按 VIE 分数筛选；直接取前 TOP_K 条（如不足则全量）
+    valid = results
     top_items = valid[:TOP_K]
 
     # 分层采样
@@ -52,8 +60,8 @@ def main():
     # 遍历采样结果，拷贝视频并生成 info.txt
     for idx, item in enumerate(sampled):
         idx_str = f"{idx:03d}"
-        # 复制 source 和 target 视频
-        for role, tag in (('source_video_path', 'src'), ('target_video_path', 'tgt')):
+        # 复制 original 和 edited 视频
+        for role, tag in (("original_video", 'ori'), ("edited_video", 'edit')):
             rel = item.get(role, '').lstrip('./')
             # rel = rel.replace('/scratch3/yan204/yxp/', '/projects/D2DCRC/xiangpeng/')
             if not rel:
@@ -78,19 +86,14 @@ def main():
         info_path = Path(OUTPUT_DIR) / f"{idx_str}_info.txt"
         with open(info_path, 'w', encoding='utf-8') as info_f:
             info_f.write(f"sample_id: {idx}\n")
-            info_f.write(f"original_vie_rank: {valid.index(item) + 1}\n")
-            info_f.write(f"vie_overall_score: {item.get('vie_overall_score')}\n")
-            info_f.write(f"instruction: {item.get('instruction', '')}\n")
-            info_f.write(f"enhanced_instruction: {item.get('enhanced_instruction', '')}\n")
-            info_f.write(f"qwen_vl_72b_refined_instruction: {item.get('qwen_vl_72b_refined_instruction', '')}\n")
-            info_f.write(f"source_video_path: {item.get('source_video_path', '')}\n")
-            info_f.write(f"target_video_path: {item.get('target_video_path', '')}\n")
-            info_f.write(f"multi_instances: {item.get('multi_instances', '')}\n")
+            info_f.write(f"json_key: {item.get('_id', '')}\n")
+            info_f.write(f"edit_instruction: {item.get('edit_instruction', '')}\n")
+            info_f.write(f"original_video: {item.get('original_video', '')}\n")
+            info_f.write(f"edited_video: {item.get('edited_video', '')}\n")
 
     # 生成简要采样汇总
     summary = {
         'total_original': len(results),
-        'valid_with_score': len(valid),
         'top_k_used': len(top_items),
         'final_sampled': len(sampled)
     }
