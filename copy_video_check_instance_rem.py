@@ -7,6 +7,7 @@ import os
 import json
 import shutil
 import random
+import re
 from pathlib import Path
 
 # -------- 配置区域 --------
@@ -15,7 +16,7 @@ JSON_PATH = "grounding_multi_instance_rem.json"
 OUTPUT_DIR = "sample_videos/grounding_multi_instance_rem_check"
 TOP_K = 4000        # 取 VIE score top K
 LAYER_SIZE = 1000      # 每层数据大小
-SAMPLES_PER_LAYER = 10  # 每层采样数
+SAMPLES_PER_LAYER = 20  # 每层采样数
 
 
 # -------------------------
@@ -60,7 +61,7 @@ def main():
     # 遍历采样结果，拷贝视频并生成 info.txt
     for idx, item in enumerate(sampled):
         idx_str = f"{idx:03d}"
-        # 复制 original 和 edited 视频
+        # 复制 original 和 edited 视频（mask 与 rem）
         for role, tag in (("original_video", 'ori'), ("edited_video", 'edit')):
             rel = item.get(role, '').lstrip('./')
             # rel = rel.replace('/scratch3/yan204/yxp/', '/projects/D2DCRC/xiangpeng/')
@@ -82,6 +83,29 @@ def main():
             dest_path = Path(OUTPUT_DIR) / dest_name
             shutil.copy2(src_path, dest_path)
 
+        # 额外：推断并复制原始 org_reshape 视频
+        org_rel = ''
+        mask_rel = item.get('original_video', '').lstrip('./')
+        if mask_rel:
+            replaced = re.sub(r"_mask_\d+\.mp4$", "_org_reshape.mp4", mask_rel)
+            if replaced != mask_rel:
+                org_rel = replaced
+        if not org_rel:
+            rem_rel = item.get('edited_video', '').lstrip('./')
+            if rem_rel:
+                replaced = re.sub(r"_rem_\d+\.mp4$", "_org_reshape.mp4", rem_rel)
+                if replaced != rem_rel:
+                    org_rel = replaced
+
+        if org_rel:
+            org_path = Path(BASE_DATASET_DIR) / org_rel
+            if org_path.is_file():
+                dest_name = f"{idx_str}_org_{org_path.name}"
+                dest_path = Path(OUTPUT_DIR) / dest_name
+                shutil.copy2(org_path, dest_path)
+            else:
+                print(f"[警告] 原始视频不存在(推断): {org_path}")
+
         # 生成 info.txt
         info_path = Path(OUTPUT_DIR) / f"{idx_str}_info.txt"
         with open(info_path, 'w', encoding='utf-8') as info_f:
@@ -90,6 +114,19 @@ def main():
             info_f.write(f"edit_instruction: {item.get('edit_instruction', '')}\n")
             info_f.write(f"original_video: {item.get('original_video', '')}\n")
             info_f.write(f"edited_video: {item.get('edited_video', '')}\n")
+            # 记录推断的原始 org_reshape 路径（若存在推断）
+            mask_rel = item.get('original_video', '').lstrip('./')
+            rem_rel = item.get('edited_video', '').lstrip('./')
+            inferred_org = ''
+            if mask_rel:
+                tmp = re.sub(r"_mask_\d+\.mp4$", "_org_reshape.mp4", mask_rel)
+                if tmp != mask_rel:
+                    inferred_org = tmp
+            if not inferred_org and rem_rel:
+                tmp = re.sub(r"_rem_\d+\.mp4$", "_org_reshape.mp4", rem_rel)
+                if tmp != rem_rel:
+                    inferred_org = tmp
+            info_f.write(f"original_org_reshape_inferred: {inferred_org}\n")
 
     # 生成简要采样汇总
     summary = {
