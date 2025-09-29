@@ -16,7 +16,7 @@ JSON_PATH = "grounding_multi_instance_rem.json"
 OUTPUT_DIR = "sample_videos/grounding_multi_instance_rem_check"
 TOP_K = 4000        # 取 VIE score top K
 LAYER_SIZE = 1000      # 每层数据大小
-SAMPLES_PER_LAYER = 20  # 每层采样数
+SAMPLES_PER_LAYER = 10  # 每层采样数
 
 
 # -------------------------
@@ -87,13 +87,13 @@ def main():
         org_rel = ''
         mask_rel = item.get('original_video', '').lstrip('./')
         if mask_rel:
-            replaced = re.sub(r"_mask_\d+\.mp4$", "_org_reshape.mp4", mask_rel)
+            replaced = re.sub(r"_mask_\d+\.mp4$", "_org.mp4", mask_rel)
             if replaced != mask_rel:
                 org_rel = replaced
         if not org_rel:
             rem_rel = item.get('edited_video', '').lstrip('./')
             if rem_rel:
-                replaced = re.sub(r"_rem_\d+\.mp4$", "_org_reshape.mp4", rem_rel)
+                replaced = re.sub(r"_rem_\d+\.mp4$", "_org.mp4", rem_rel)
                 if replaced != rem_rel:
                     org_rel = replaced
 
